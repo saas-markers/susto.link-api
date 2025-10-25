@@ -101,10 +101,10 @@ app.use(express.json());
 app.use(cookieParser());
 
 const asyncHandler = <TRequest extends Request, TResponse extends Response>(
-  fn: (req: TRequest, res: TResponse, next: NextFunction) => Promise<void>,
+  fn: (req: TRequest, res: TResponse, next: NextFunction) => Promise<Response | void>,
 ) => {
   return (req: TRequest, res: TResponse, next: NextFunction) => {
-    fn(req, res, next).catch(next);
+    Promise.resolve(fn(req, res, next)).catch(next);
   };
 };
 
