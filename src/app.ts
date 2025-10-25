@@ -53,8 +53,9 @@ if (!databaseUrl) {
 
 export const pool = new Pool({
   connectionString: databaseUrl,
-  ssl: { rejectUnauthorized: false },
+  // ssl: { rejectUnauthorized: false },
 });
+
 
 async function initDb(): Promise<void> {
   await pool.query(`
