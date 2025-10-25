@@ -118,27 +118,30 @@ app.post(
     const token: string | undefined = req.cookies?.token;
 
     if (!token) {
-      return res.status(401).json({
+      res.status(401).json({
         allowed: false,
         reason: 'missingToken',
         message: 'A "token" cookie is required to evaluate link access.',
       });
+      return;
     }
 
     if (!isNonEmptyString(baseUrl) || !isNonEmptyString(subdomain) || !isNonEmptyString(id)) {
-      return res.status(400).json({
+      res.status(400).json({
         allowed: false,
         reason: 'invalidPayload',
         message: '"baseUrl", "subdomain" and "id" must be non-empty strings.',
       });
+      return;
     }
 
     if (typeof maxShares !== 'number' || !Number.isInteger(maxShares) || maxShares <= 0) {
-      return res.status(400).json({
+      res.status(400).json({
         allowed: false,
         reason: 'invalidPayload',
         message: '"maxShares" must be a positive integer.',
       });
+      return;
     }
 
     try {
@@ -256,10 +259,12 @@ app.post(
         };
       });
 
-      return res.json(result);
+      res.json(result);
+      return;
     } catch (error) {
       if (error instanceof HttpError) {
-        return res.status(error.status).json(error.body);
+        res.status(error.status).json(error.body);
+        return;
       }
 
       throw error;
