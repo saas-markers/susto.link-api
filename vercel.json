@@ -1,8 +1,12 @@
 {
-  "functions": {
-    "api/index.ts": {
-      "runtime": "vercel-nodejs@4.0.0"
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/index.ts",
+      "use": "@vercel/node"
     }
-  },
-  "buildCommand": "npm run build"
+  ],
+  "routes": [
+    { "src": "/(.*)", "dest": "/api/index.ts" }
+  ]
 }
