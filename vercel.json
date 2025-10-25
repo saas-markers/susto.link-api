@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "api/index.ts": {
+      "runtime": "vercel-nodejs@4.0.0"
+    }
+  },
+  "buildCommand": "npm run build"
+}
