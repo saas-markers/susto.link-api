@@ -18,6 +18,7 @@ interface LinkAccessResult {
   maxShares: number;
   repeatAccessAllowed: boolean;
   visitsForToken?: number;
+  isNewVisitor?: boolean;
   reason?: string;
   message?: string;
 }
@@ -218,25 +219,9 @@ app.post(
           });
         }
 
-        const newVisitCount = previousVisits + 1;
+        const isFirstAccess = previousVisits === 0;
 
-        await client.query(
-          `INSERT INTO link_visits (link_id, token, visit_count)
-           VALUES ($1, $2, $3)
-           ON CONFLICT (link_id, token) DO UPDATE
-             SET visit_count = EXCLUDED.visit_count`,
-          [linkRecord.id, token, newVisitCount],
-        );
-
-        const updateShare = await client.query<LinkShareRow>(
-          `UPDATE link_shares
-              SET remaining_shares = remaining_shares - 1
-            WHERE id = $1 AND remaining_shares > 0
-            RETURNING id, base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat`,
-          [linkRecord.id],
-        );
-
-        if (updateShare.rowCount === 0) {
+        if (isFirstAccess && linkRecord.remaining_shares <= 0) {
           throw new HttpError(403, {
             allowed: false,
             reason: 'shareLimitReached',
@@ -248,14 +233,56 @@ app.post(
           });
         }
 
-        const updatedLink = updateShare.rows[0];
+        const newVisitCount = previousVisits + 1;
+
+        await client.query(
+          `INSERT INTO link_visits (link_id, token, visit_count)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (link_id, token) DO UPDATE
+             SET visit_count = EXCLUDED.visit_count`,
+          [linkRecord.id, token, newVisitCount],
+        );
+
+        if (isFirstAccess) {
+          const updateShare = await client.query<LinkShareRow>(
+            `UPDATE link_shares
+                SET remaining_shares = remaining_shares - 1
+              WHERE id = $1 AND remaining_shares > 0
+              RETURNING id, base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat`,
+            [linkRecord.id],
+          );
+
+          if (updateShare.rowCount === 0) {
+            throw new HttpError(403, {
+              allowed: false,
+              reason: 'shareLimitReached',
+              message: 'Share limit reached for this link.',
+              remainingShares: 0,
+              maxShares: linkRecord.max_shares,
+              repeatAccessAllowed: linkRecord.allow_repeat,
+              visitsForToken: previousVisits,
+            });
+          }
+
+          const updatedLink = updateShare.rows[0];
+
+          return {
+            allowed: true,
+            remainingShares: updatedLink.remaining_shares,
+            maxShares: updatedLink.max_shares,
+            repeatAccessAllowed: updatedLink.allow_repeat,
+            visitsForToken: newVisitCount,
+            isNewVisitor: true,
+          };
+        }
 
         return {
           allowed: true,
-          remainingShares: updatedLink.remaining_shares,
-          maxShares: updatedLink.max_shares,
-          repeatAccessAllowed: updatedLink.allow_repeat,
+          remainingShares: linkRecord.remaining_shares,
+          maxShares: linkRecord.max_shares,
+          repeatAccessAllowed: linkRecord.allow_repeat,
           visitsForToken: newVisitCount,
+          isNewVisitor: false,
         };
       });
 
