@@ -25,7 +25,8 @@ export default async function vercelHandler(req: IncomingMessage, res: ServerRes
     res.on('close', onFinish);
     res.on('error', onError);
 
-    app(req, res, (err?: unknown) => {
+    // ✅ converter req/res para any (Express compatível)
+    app(req as any, res as any, (err?: unknown) => {
       if (err) {
         cleanup();
         reject(err);
