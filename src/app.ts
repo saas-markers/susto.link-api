@@ -1,5 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cookieParser from 'cookie-parser';
+import { randomBytes } from 'crypto';
 import { Pool, PoolClient } from 'pg';
 
 interface LinkShareRow {
@@ -10,6 +11,7 @@ interface LinkShareRow {
   max_shares: number;
   remaining_shares: number;
   allow_repeat: boolean;
+  share_token: string | null;
 }
 
 interface LinkAccessResult {
@@ -45,6 +47,30 @@ function normalizeRepeatAccess(value: unknown, fallback: boolean): boolean {
   return fallback;
 }
 
+function generateShareToken(): string {
+  return randomBytes(16).toString('hex');
+}
+
+function buildShareUrl(baseUrl: string, subdomain: string, shareToken: string): string {
+  const sanitizedToken = shareToken.trim();
+  const sanitizedSubdomain = subdomain.trim().replace(/^\.+/, '').replace(/\.+$/, '');
+  const hasProtocol = /^[a-z][a-z\d+\-.]*:\/\//i.test(baseUrl);
+
+  if (hasProtocol) {
+    const url = new URL(baseUrl);
+    if (sanitizedSubdomain.length > 0) {
+      url.hostname = `${sanitizedSubdomain}.${url.hostname}`;
+    }
+    const basePath = url.pathname.replace(/\/+$/, '');
+    url.pathname = `${basePath}/${sanitizedToken}`.replace(/\/{2,}/g, '/');
+    return url.toString();
+  }
+
+  const sanitizedBase = baseUrl.replace(/\/+$/, '');
+  const prefix = sanitizedSubdomain.length > 0 ? `${sanitizedSubdomain}.` : '';
+  return `${prefix}${sanitizedBase}/${sanitizedToken}`;
+}
+
 const databaseUrl = process.env.DATABASE_URL;
 
 if (!databaseUrl) {
@@ -67,6 +93,7 @@ async function initDb(): Promise<void> {
       max_shares INTEGER NOT NULL,
       remaining_shares INTEGER NOT NULL,
       allow_repeat BOOLEAN NOT NULL,
+      share_token TEXT UNIQUE,
       created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
       UNIQUE(base_url, subdomain, resource_id)
     );
@@ -79,6 +106,11 @@ async function initDb(): Promise<void> {
       visit_count INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (link_id, token)
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE link_shares
+      ADD COLUMN IF NOT EXISTS share_token TEXT UNIQUE;
   `);
 }
 
@@ -114,9 +146,130 @@ app.get('/health', (_req: Request, res: Response) => {
 });
 
 app.post(
-  '/links/access',
+  '/links',
   asyncHandler(async (req: Request, res: Response) => {
     const { baseUrl, subdomain, id, maxShares, allowRepeatAccess = true } = req.body ?? {};
+
+    if (!isNonEmptyString(baseUrl) || !isNonEmptyString(subdomain) || !isNonEmptyString(id)) {
+      return res.status(400).json({
+        reason: 'invalidPayload',
+        message: '"baseUrl", "subdomain" and "id" must be non-empty strings.',
+      });
+    }
+
+    if (typeof maxShares !== 'number' || !Number.isInteger(maxShares) || maxShares <= 0) {
+      return res.status(400).json({
+        reason: 'invalidPayload',
+        message: '"maxShares" must be a positive integer.',
+      });
+    }
+
+    try {
+      const { created, responseBody } = await withTransaction<{
+        created: boolean;
+        responseBody: {
+          link: string;
+          shareToken: string;
+          baseUrl: string;
+          subdomain: string;
+          resourceId: string;
+          maxShares: number;
+          remainingShares: number;
+          repeatAccessAllowed: boolean;
+        };
+      }>(async (client) => {
+        const linkQuery = await client.query<LinkShareRow>(
+          `SELECT id, base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat, share_token
+             FROM link_shares
+            WHERE base_url = $1 AND subdomain = $2 AND resource_id = $3
+            FOR UPDATE`,
+          [baseUrl, subdomain, id],
+        );
+
+        let linkRecord = linkQuery.rows[0];
+        const normalizedRepeat = normalizeRepeatAccess(allowRepeatAccess, linkRecord?.allow_repeat ?? true);
+
+        let created = false;
+
+        if (!linkRecord) {
+          const shareToken = generateShareToken();
+          const inserted = await client.query<LinkShareRow>(
+            `INSERT INTO link_shares (base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat, share_token)
+             VALUES ($1, $2, $3, $4, $4, $5, $6)
+             RETURNING id, base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat, share_token`,
+            [baseUrl, subdomain, id, maxShares, normalizedRepeat, shareToken],
+          );
+          linkRecord = inserted.rows[0];
+          created = true;
+        } else {
+          if (linkRecord.max_shares !== maxShares) {
+            throw new HttpError(409, {
+              reason: 'conflictingLimit',
+              message: `Link already registered with a max share count of ${linkRecord.max_shares}.`,
+              remainingShares: linkRecord.remaining_shares,
+              maxShares: linkRecord.max_shares,
+              repeatAccessAllowed: linkRecord.allow_repeat,
+              shareToken: linkRecord.share_token ?? undefined,
+            });
+          }
+
+          if (linkRecord.allow_repeat !== normalizedRepeat) {
+            const updated = await client.query<LinkShareRow>(
+              `UPDATE link_shares
+                  SET allow_repeat = $1
+                WHERE id = $2
+                RETURNING id, base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat, share_token`,
+              [normalizedRepeat, linkRecord.id],
+            );
+            linkRecord = updated.rows[0];
+          }
+
+          if (!linkRecord.share_token) {
+            const refreshed = await client.query<LinkShareRow>(
+              `UPDATE link_shares
+                  SET share_token = $1
+                WHERE id = $2
+                RETURNING id, base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat, share_token`,
+              [generateShareToken(), linkRecord.id],
+            );
+            linkRecord = refreshed.rows[0];
+          }
+        }
+
+        if (!linkRecord?.share_token) {
+          throw new Error('Failed to assign a share token to the link.');
+        }
+
+        return {
+          created,
+          responseBody: {
+            link: buildShareUrl(baseUrl, subdomain, linkRecord.share_token),
+            shareToken: linkRecord.share_token,
+            baseUrl,
+            subdomain,
+            resourceId: linkRecord.resource_id,
+            maxShares: linkRecord.max_shares,
+            remainingShares: linkRecord.remaining_shares,
+            repeatAccessAllowed: linkRecord.allow_repeat,
+          },
+        };
+      });
+
+      return res.status(created ? 201 : 200).json(responseBody);
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return res.status(error.status).json(error.body);
+      }
+
+      throw error;
+    }
+  }),
+);
+
+app.post(
+  '/links/access',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { shareToken } = req.body ?? {};
     const token: string | undefined = req.cookies?.token;
 
     if (!token) {
@@ -127,65 +280,32 @@ app.post(
       });
     }
 
-    if (!isNonEmptyString(baseUrl) || !isNonEmptyString(subdomain) || !isNonEmptyString(id)) {
+    if (!isNonEmptyString(shareToken)) {
       return res.status(400).json({
         allowed: false,
         reason: 'invalidPayload',
-        message: '"baseUrl", "subdomain" and "id" must be non-empty strings.',
-      });
-    }
-
-    if (typeof maxShares !== 'number' || !Number.isInteger(maxShares) || maxShares <= 0) {
-      return res.status(400).json({
-        allowed: false,
-        reason: 'invalidPayload',
-        message: '"maxShares" must be a positive integer.',
+        message: '"shareToken" must be a non-empty string.',
       });
     }
 
     try {
       const result = await withTransaction<LinkAccessResult>(async (client) => {
         const linkQuery = await client.query<LinkShareRow>(
-          `SELECT id, base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat
+          `SELECT id, base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat, share_token
              FROM link_shares
-            WHERE base_url = $1 AND subdomain = $2 AND resource_id = $3
+            WHERE share_token = $1
             FOR UPDATE`,
-          [baseUrl, subdomain, id],
+          [shareToken],
         );
 
-        let linkRecord = linkQuery.rows[0];
-        const normalizedRepeat = normalizeRepeatAccess(allowRepeatAccess, linkRecord?.allow_repeat ?? true);
+        const linkRecord = linkQuery.rows[0];
 
         if (!linkRecord) {
-          const inserted = await client.query<LinkShareRow>(
-            `INSERT INTO link_shares (base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat)
-             VALUES ($1, $2, $3, $4, $4, $5)
-             RETURNING id, base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat`,
-            [baseUrl, subdomain, id, maxShares, normalizedRepeat],
-          );
-          linkRecord = inserted.rows[0];
-        } else {
-          if (linkRecord.max_shares !== maxShares) {
-            throw new HttpError(409, {
-              allowed: false,
-              reason: 'conflictingLimit',
-              message: `Link already registered with a max share count of ${linkRecord.max_shares}.`,
-              remainingShares: linkRecord.remaining_shares,
-              maxShares: linkRecord.max_shares,
-              repeatAccessAllowed: linkRecord.allow_repeat,
-            });
-          }
-
-          if (linkRecord.allow_repeat !== normalizedRepeat) {
-            const updated = await client.query<LinkShareRow>(
-              `UPDATE link_shares
-                  SET allow_repeat = $1
-                WHERE id = $2
-                RETURNING id, base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat`,
-              [normalizedRepeat, linkRecord.id],
-            );
-            linkRecord = updated.rows[0];
-          }
+          throw new HttpError(404, {
+            allowed: false,
+            reason: 'linkNotFound',
+            message: 'No link registered for the provided share token.',
+          });
         }
 
         if (linkRecord.remaining_shares <= 0) {
@@ -246,7 +366,7 @@ app.post(
             `UPDATE link_shares
                 SET remaining_shares = remaining_shares - 1
               WHERE id = $1 AND remaining_shares > 0
-              RETURNING id, base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat`,
+              RETURNING id, base_url, subdomain, resource_id, max_shares, remaining_shares, allow_repeat, share_token`,
             [linkRecord.id],
           );
 
