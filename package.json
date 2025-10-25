@@ -1,0 +1,26 @@
+{
+  "name": "susto.link-api",
+  "version": "1.0.0",
+  "description": "API for limiting link shares based on cookie tokens",
+  "main": "dist/src/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/src/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cookie-parser": "^1.4.6",
+    "express": "^4.18.2",
+    "pg": "^8.11.3"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "^1.4.3",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.10.6",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.3.3"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "api/index.ts": {
+      "runtime": "nodejs18.x"
+    }
+  },
+  "buildCommand": "npm run build"
+}
